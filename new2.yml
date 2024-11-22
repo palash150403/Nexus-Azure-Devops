@@ -1,0 +1,72 @@
+trigger:
+  branches:
+    include:
+      - main  
+
+pool:
+  vmImage: 'windows-latest'  
+
+variables:
+  RestoreBuildProjects: '**/*.csproj'  
+  BuildConfiguration: 'Release'  
+  NuGetPackageOutput: '$(Build.ArtifactStagingDirectory)/nuget'  
+
+steps:
+  - script: dir /s
+    displayName: 'List all files in the repository'
+
+  - task: UseDotNet@2
+    inputs:
+      packageType: 'sdk'
+      version: '8.x'  
+      installationPath: $(Agent.ToolsDirectory)/dotnet
+
+  - task: DotNetCoreCLI@2
+    displayName: Restore
+    inputs:
+      command: restore
+      projects: '$(RestoreBuildProjects)'  
+
+  - task: DotNetCoreCLI@2
+    displayName: Build
+    inputs:
+      projects: '$(RestoreBuildProjects)'
+      arguments: '--configuration $(BuildConfiguration)'
+
+  - task: DotNetCoreCLI@2
+    displayName: Pack
+    inputs:
+      command: pack
+      packagesToPack: '$(RestoreBuildProjects)'  
+      versioningScheme: 'off'  
+      outputDir: '$(NuGetPackageOutput)'  
+
+  - task: DotNetCoreCLI@2
+    displayName: Test
+    inputs:
+      command: test
+      projects: '$(TestProjects)'  
+      arguments: '--configuration $(BuildConfiguration)'
+
+  - task: DotNetCoreCLI@2
+    displayName: Publish
+    inputs:
+      command: publish
+      publishWebProjects: True
+      arguments: '--configuration $(BuildConfiguration) --output $(Build.ArtifactStagingDirectory)'
+      zipAfterPublish: True
+
+  - task: PublishBuildArtifacts@1
+    displayName: 'Publish Artifact'
+    inputs:
+      PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+    condition: succeededOrFailed()
+
+
+  - task: NuGetCommand@2
+    inputs:
+      command: 'push'
+      packagesToPush: '$(Build.ArtifactStagingDirectory)/**/*.nupkg;!$(Build.ArtifactStagingDirectory)/**/*.symbols.nupkg'
+      nuGetFeedType: 'external'
+      publishFeedCredentials: 'develop-con'
+
