@@ -6,17 +6,17 @@ trigger:
       - release
 
 pool:
-  vmImage: 'windows-latest'
+  vmImage: 'ubuntu-latest'
 
 variables:
   RestoreBuildProjects: '**/*.csproj'
   BuildConfiguration: 'Release'
   NuGetPackageOutput: '$(Build.ArtifactStagingDirectory)/nuget'
-  DemoFolderPath: '$(Build.ArtifactStagingDirectory)/demo'
+  ProjectName: 'helloworld'
 
 steps:
 # Step 1: Display all files in the repository
-- script: dir /s
+- script: ls -R
   displayName: 'List all files in the repository'
 
 # Step 2: Set up .NET SDK
@@ -40,29 +40,58 @@ steps:
     projects: '$(RestoreBuildProjects)'
     arguments: '--configuration $(BuildConfiguration)'
 
-# Step 5: Set dynamic versioning and paths
+# Step 5: Set Dynamic Versioning and Paths
 - script: |
-    echo Determining branch-specific versioning and paths...
-    SET DEFAULT_BUILD_ID=1
-    SET BUILD_ID=%Build.BuildId%
-    IF "%BUILD_ID%"=="" SET BUILD_ID=%DEFAULT_BUILD_ID%
+    echo "Determining branch-specific versioning and paths..."
 
-    IF "%Build.SourceBranchName%"=="develop" (
-        SET VERSION=1.0.%BUILD_ID%-alpha
-        SET PACK_OUTPUT=%DemoFolderPath%
-        mkdir "%DemoFolderPath%"
-    ) ELSE IF "%Build.SourceBranchName%"=="main" (
-        SET VERSION=1.0.%BUILD_ID%
-        SET PACK_OUTPUT=%NuGetPackageOutput%\1.0
-        mkdir "%PACK_OUTPUT%"
-    ) ELSE (
-        SET VERSION=1.0.%BUILD_ID%-beta
-        SET PACK_OUTPUT=%NuGetPackageOutput%
-    )
-    echo Generated version: %VERSION%
-    echo ##vso[task.setvariable variable=PackageVersion]%VERSION%
-    echo ##vso[task.setvariable variable=NuGetPackageOutput]%PACK_OUTPUT%
+    # Default values
+    DEFAULT_BUILD_BUILDNUMBER=1
+    BUILD_BUILDNUMBER=$(Build.BuildNumber)
+    COMMIT_ID=$(echo "$BUILD_SOURCEVERSION" | cut -c 1-5)  
+    BRANCH_NAME=$(Build.SourceBranchName)
+
+    echo "Branch name is: $BRANCH_NAME"
+
+    # Initialize PACK_OUTPUT with default NuGetPackageOutput
+    PACK_OUTPUT=$(Build.ArtifactStagingDirectory)/nuget
+
+    # Branch-specific logic for versioning and output path
+    if [ "$BRANCH_NAME" == "develop" ]; then
+        VERSION="1.0.0-$BUILD_BUILDNUMBER"
+    elif [ "$BRANCH_NAME" == "main" ]; then
+        VERSION="$(ProjectName)-1.0.$BUILD_BUILDNUMBER"
+        PACK_OUTPUT="$(Build.ArtifactStagingDirectory)/nuget/1.0"
+    elif [ "$BRANCH_NAME" == "release" ]; then
+        VERSION="1.0.0-$COMMIT_ID-$BRANCH_NAME"
+        PACK_OUTPUT="$(Build.ArtifactStagingDirectory)/nuget/release"
+    else
+        VERSION="$(ProjectName)-1.0.$BUILD_BUILDNUMBER-beta"
+    fi
+
+    echo "Using output path: $PACK_OUTPUT"
+    echo "Generated version: $VERSION"
+
+    # Set pipeline variables
+    echo "##vso[task.setvariable variable=PackageVersion]$VERSION"
+    echo "##vso[task.setvariable variable=NuGetPackageOutput]$PACK_OUTPUT"
   displayName: 'Set Dynamic Versioning and Paths'
+
+- script: |
+    echo "Updating PackageId in .csproj for release branch..."
+
+    SHORT_COMMIT_ID=$(echo "$(Build.SourceVersion)" | cut -c 1-5)
+    echo "Short Commit ID: $SHORT_COMMIT_ID"
+
+    PACKAGE_ID="$(ProjectName)-$(PackageVersion)-$SHORT_COMMIT_ID-$(Build.SourceBranchName)"
+    echo "Dynamic PackageId: $PACKAGE_ID"
+
+    find . -name '*.csproj' -exec sed -i "s|<PackageId>.*</PackageId>|<PackageId>${PACKAGE_ID}</PackageId>|g" {} +
+
+    find . -name '*.csproj' -exec cat {} \;
+
+  condition: eq(variables['Build.SourceBranchName'], 'release')
+  displayName: 'Update PackageId in .csproj for release'
+
 
 # Step 6: Pack the project
 - task: DotNetCoreCLI@2
@@ -71,8 +100,8 @@ steps:
     command: pack
     packagesToPack: '$(RestoreBuildProjects)'
     versioningScheme: 'off'
-    arguments: '--version $(PackageVersion)'
-    outputDir: '$(NuGetPackageOutput)'
+    arguments: '--configuration $(BuildConfiguration) /p:PackageVersion=$(PackageVersion)'
+    outputDir: '$(NuGetPackageOutput)'  
 
 # Step 7: Publish the project
 - task: DotNetCoreCLI@2
@@ -117,4 +146,3 @@ steps:
     packagesToPush: '$(NuGetPackageOutput)/**/*.nupkg'
     nuGetFeedType: 'external'
     publishFeedCredentials: 'release-con'
-
