@@ -1,0 +1,176 @@
+trigger:
+  branches:
+    include:
+      - develop
+      - release
+  tags:
+    include:
+      - '*'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  RestoreBuildProjects: '**/*.csproj'
+  BuildConfiguration: 'Release'
+  NuGetPackageOutput: '$(Build.ArtifactStagingDirectory)/nuget'
+  ProjectName: 'helloworld'
+
+stages:
+- stage: tag
+  displayName: "Tag Stage"
+  jobs:
+  - job: TagValidationJob
+    displayName: "Tag Validation Job"
+    steps:
+    - script: ls -R
+      displayName: 'List all files in the repository'
+    - script: |
+        echo "Checking Source Branch/Tag: $(Build.SourceBranch)"
+        BUILD_BUILDNUMBER=$(Build.BuildNumber)
+        COMMIT_ID=$(echo "$BUILD_SOURCEVERSION" | cut -c 1-5)
+        BRANCH_NAME=$(Build.SourceBranchName)
+
+        if [[ "$BRANCH_NAME" == refs/tags/* ]]; then
+          TAG_NAME=$(echo "$(Build.SourceBranch)" | sed 's|refs/tags/||')
+          git fetch --unshallow || true
+          MAIN_COMMIT=$(git rev-parse origin/main)
+          TAG_COMMIT=$(git rev-parse "${Build.SourceVersion}")
+
+          if [[ "$TAG_COMMIT" == "$MAIN_COMMIT" ]]; then
+            VERSION="${TAG_NAME}-$(ProjectName)"
+            PACK_OUTPUT="$(Build.ArtifactStagingDirectory)/nuget"
+          else
+            echo "Error: Tags must be created on the main branch."
+            exit 1
+          fi
+        elif [[ "$(Build.SourceBranchName)" == "develop" ]]; then
+          VERSION="1.0.0-${BUILD_BUILDNUMBER}"
+          PACK_OUTPUT=$(Build.ArtifactStagingDirectory)/nuget
+
+        elif [[ "$(Build.SourceBranchName)" == "release" ]]; then
+          VERSION="1.0.0-${COMMIT_ID}-release"
+          PACK_OUTPUT="$(Build.ArtifactStagingDirectory)/nuget"
+        else
+          echo "Error: Unsupported branch/tag for setting package name/version."
+          exit 1
+        fi
+        echo "##vso[task.setvariable variable=PackageVersion;isOutput=true]$VERSION"
+        echo "##vso[task.setvariable variable=NuGetPackageOutput;isOutput=true]$PACK_OUTPUT"
+      displayName: 'Set Package Name and Version'
+      name: tagOutput
+
+- stage: build
+  displayName: "Build Stage"
+  dependsOn: tag
+  condition: succeeded('tag')
+  variables:
+    PackageVersion: $[ stageDependencies.tag.TagValidationJob.outputs['tagOutput.PackageVersion'] ]
+    NuGetPackageOutput: $[ stageDependencies.tag.TagValidationJob.outputs['tagOutput.NuGetPackageOutput'] ]
+  jobs:
+  - job: BuildAndPackJob
+    displayName: "Build and Pack Job"
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        packageType: 'sdk'
+        version: '8.x'
+        installationPath: $(Agent.ToolsDirectory)/dotnet 
+
+    - task: DotNetCoreCLI@2
+      displayName: Restore
+      inputs:
+        command: restore
+        projects: '$(RestoreBuildProjects)'
+
+    - task: DotNetCoreCLI@2
+      displayName: Build
+      inputs:
+        projects: '$(RestoreBuildProjects)'
+        arguments: '--configuration $(BuildConfiguration)'
+
+    # Step 5.1: Update PackageId in .csproj for main branch
+    - script: |
+        echo "Updating PackageId in .csproj for main branch..."
+
+        # Get the nearest tag using 'git describe' or 'git tag' if no tag exists
+        TAG=$(git describe --tags --exact-match 2>/dev/null || git tag --sort=-creatordate | head -n 1 || echo "untagged")
+        echo "Tag: $TAG"
+
+        # Construct the dynamic PackageId
+        PACKAGE_ID="$TAG-$(ProjectName)"
+        echo "Dynamic PackageId: $PACKAGE_ID"
+
+        # Update the .csproj file with the dynamic PackageId
+        find . -name '*.csproj' -exec sed -i "s|<PackageId>.*</PackageId>|<PackageId>${PACKAGE_ID}</PackageId>|g" {} +
+
+        # Confirm the update by printing the .csproj file contents
+        find . -name '*.csproj' -exec cat {} \;
+
+      condition: eq(variables['Build.SourceBranchName'], 'main')
+      displayName: 'Update PackageId in .csproj for main'
+
+
+
+
+
+    # Step 5.2: Update PackageId in .csproj for release branch
+    - script: |
+        echo "Updating PackageId in .csproj for release branch..."
+
+        SHORT_COMMIT_ID=$(echo "$(Build.SourceVersion)" | cut -c 1-6)
+        echo "Short Commit ID: $SHORT_COMMIT_ID"
+
+        PACKAGE_ID="$(ProjectName)-$(PackageVersion)-$SHORT_COMMIT_ID-$(Build.SourceBranchName)"
+        echo "Dynamic PackageId: $PACKAGE_ID"
+
+        find . -name '*.csproj' -exec sed -i "s|<PackageId>.*</PackageId>|<PackageId>${PACKAGE_ID}</PackageId>|g" {} +
+
+        find . -name '*.csproj' -exec cat {} \;
+
+      condition: eq(variables['Build.SourceBranchName'], 'release')
+      displayName: 'Update PackageId in .csproj for release'
+
+    - task: DotNetCoreCLI@2
+      displayName: Pack
+      inputs:
+        command: pack
+        packagesToPack: '$(RestoreBuildProjects)'
+        versioningScheme: 'off'
+        arguments: '--configuration $(BuildConfiguration) /p:PackageVersion=$(PackageVersion)'
+        outputDir: '$(NuGetPackageOutput)'
+
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Build Artifacts'
+      inputs:
+        PathtoPublish: '$(NuGetPackageOutput)'
+
+
+    # Step 9: Push NuGet packages based on branch
+    - task: NuGetCommand@2
+      displayName: 'Push NuGet Package (Develop)'
+      condition: eq(variables['Build.SourceBranchName'], 'develop')
+      inputs:
+        command: 'push'
+        packagesToPush: '$(NuGetPackageOutput)/**/*.nupkg'
+        nuGetFeedType: 'external'
+        publishFeedCredentials: 'develop-con'
+
+    - task: NuGetCommand@2
+      displayName: 'Push NuGet Package (Main)'
+      condition: eq(variables['Build.SourceBranchName'], 'main')
+      inputs:
+        command: 'push'
+        packagesToPush: '$(NuGetPackageOutput)/**/*.nupkg'
+        nuGetFeedType: 'external'
+        publishFeedCredentials: 'main-con'
+
+    - task: NuGetCommand@2
+      displayName: 'Push NuGet Package (Release)'
+      condition: eq(variables['Build.SourceBranchName'], 'release')
+      inputs:
+        command: 'push'
+        packagesToPush: '$(NuGetPackageOutput)/**/*.nupkg'
+        nuGetFeedType: 'external'
+        publishFeedCredentials: 'release-con'

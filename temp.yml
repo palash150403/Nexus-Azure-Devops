@@ -1,0 +1,160 @@
+trigger:
+  branches:
+    include:
+      - develop
+      - release
+  tags:
+    include:
+      - '*'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  RestoreBuildProjects: '**/*.csproj'
+  BuildConfiguration: 'Release'
+  NuGetPackageOutput: '$(Build.ArtifactStagingDirectory)/nuget'
+  ProjectName: 'helloworld'
+
+stages:
+- stage: tag
+  displayName: "Tag Stage"
+  jobs:
+  - job: TagValidationJob
+    displayName: "Tag Validation Job"
+    steps:
+    # Step 1: Display all files in the repository
+    - script: ls -R
+      displayName: 'List all files in the repository'
+
+    # Step: Checking if a tag is present and evaluating conditions
+    - script: |
+        echo "Checking Source Branch/Tag: $(Build.SourceBranch)"
+        P
+        ProjectName="$(ProjectName)"
+
+        if [[ "$(Build.SourceBranch)" == refs/tags/* ]]; then
+          TAG_NAME="${Build.SourceBranch#refs/tags/}"
+          git fetch --unshallow || true
+          MAIN_COMMIT=$(git rev-parse origin/main)
+          TAG_COMMIT=$(git rev-parse "${Build.SourceVersion}")
+
+          if [[ "$TAG_COMMIT" == "$MAIN_COMMIT" ]]; then
+            PACKAGE_ID="${ProjectName}-${TAG_NAME}"
+            PACKAGE_VERSION="${TAG_NAME}"
+            PACK_OUTPUT="$(Build.ArtifactStagingDirectory)/nuget/1.0"
+          else
+            echo "Error: Tags must be created on the main branch."
+            exit 1
+          fi
+        elif [[ "$(Build.SourceBranchName)" == "develop" ]]; then
+          PACKAGE_ID="${ProjectName}"
+          PACKAGE_VERSION="1.0.0-$(Build.BuildNumber)"
+          PACK_OUTPUT=$(Build.ArtifactStagingDirectory)/nuget
+
+        elif [[ "$(Build.SourceBranchName)" == "release" ]]; then
+          COMMIT_ID=$(echo "$(Build.SourceVersion)" | cut -c1-6)
+          PACKAGE_ID="${ProjectName}-1.0.0-release-${COMMIT_ID}"
+          PACKAGE_VERSION="1.0.0-release-${COMMIT_ID}"
+          PACK_OUTPUT="$(Build.ArtifactStagingDirectory)/nuget/release"
+        else
+          echo "Error: Unsupported branch/tag for setting package name/version."
+          exit 1
+        fi
+
+        # Set these as pipeline variables for the following stages
+        echo "##vso[task.setvariable variable=PACKAGE_ID]$PACKAGE_ID"
+        echo "##vso[task.setvariable variable=PACKAGE_VERSION]$PACKAGE_VERSION"
+        echo "##vso[task.setvariable variable=NuGetPackageOutput]$PACK_OUTPUT"
+        echo "PACKAGE_ID: $PACKAGE_ID"
+        echo "PACKAGE_VERSION: $PACKAGE_VERSION"
+      displayName: 'Set Package Name and Version'
+
+
+- stage: build
+  displayName: "Build Stage"
+  dependsOn: tag  
+  condition: succeeded('tag')
+  jobs:
+  - job: BuildAndPackJob
+    displayName: "Build and Pack Job"
+    steps:
+    - task: UseDotNet@2
+      inputs:
+        packageType: 'sdk'
+        version: '8.x'
+        installationPath: $(Agent.ToolsDirectory)/dotnet
+
+    # Step 3: Restore NuGet packages
+    - task: DotNetCoreCLI@2
+      displayName: Restore
+      inputs:
+        command: restore
+        projects: '$(RestoreBuildProjects)'
+
+    # Step 4: Build the project
+    - task: DotNetCoreCLI@2
+      displayName: Build
+      inputs:
+        projects: '$(RestoreBuildProjects)'
+        arguments: '--configuration $(BuildConfiguration)'
+
+    # Step 5: Set Dynamic Package Versioning (using the variables set in the 'tag' stage)
+    - script: |
+        echo "Package ID: $(PACKAGE_ID)"
+        echo "Package Version: $(PACKAGE_VERSION)"
+        echo "BuildConfiguration: $(BuildConfiguration)"
+      displayName: 'Display Package ID and Version'
+
+    # Step 6: Pack the project
+    - task: DotNetCoreCLI@2
+      displayName: Pack
+      inputs:
+        command: pack
+        packagesToPack: '$(RestoreBuildProjects)'
+        versioningScheme: 'off'
+        arguments: '--configuration $(BuildConfiguration) /p:PackageVersion=$(PACKAGE_VERSION)'
+        outputDir: '$(NuGetPackageOutput)'
+
+    # Step 7: Publish the project
+    - task: DotNetCoreCLI@2
+      displayName: Publish
+      inputs:
+        command: publish
+        publishWebProjects: True
+        arguments: '--configuration $(BuildConfiguration) --output $(Build.ArtifactStagingDirectory)'
+        zipAfterPublish: True
+
+    # Step 8: Publish build artifacts
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Build Artifacts'
+      inputs:
+        PathtoPublish: '$(NuGetPackageOutput)'
+
+    # Step 9: Push NuGet packages based on branch
+    - task: NuGetCommand@2
+      displayName: 'Push NuGet Package (Develop)'
+      condition: eq(variables['Build.SourceBranchName'], 'develop')
+      inputs:
+        command: 'push'
+        packagesToPush: '$(NuGetPackageOutput)/**/*.nupkg'
+        nuGetFeedType: 'external'
+        publishFeedCredentials: 'develop-con'
+
+    - task: NuGetCommand@2
+      displayName: 'Push NuGet Package (Main)'
+      condition: eq(variables['Build.SourceBranchName'], 'main')
+      inputs:
+        command: 'push'
+        packagesToPush: '$(NuGetPackageOutput)/**/*.nupkg'
+        nuGetFeedType: 'external'
+        publishFeedCredentials: 'main-con'
+
+    - task: NuGetCommand@2
+      displayName: 'Push NuGet Package (Release)'
+      condition: eq(variables['Build.SourceBranchName'], 'release')
+      inputs:
+        command: 'push'
+        packagesToPush: '$(NuGetPackageOutput)/**/*.nupkg'
+        nuGetFeedType: 'external'
+        publishFeedCredentials: 'release-con'
